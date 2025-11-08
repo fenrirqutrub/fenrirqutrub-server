@@ -64,7 +64,7 @@ const upload = multer({
 // Middleware
 app.use(
   cors({
-    origin: "https://fenrirqutrub.vercel.app" || "http://localhost:5173",
+    origin: "https://fenrirqutrub-client.vercel.app" || "http://localhost:5173",
     credentials: true,
   })
 );
@@ -1123,7 +1123,119 @@ function formatTimeAgo(date) {
 ------------------------------------------------------------------------------------------
 */
 
-// Add this route to your existing server.js file, around line 450 (after the like/unlike routes)
+// Project Model
+const projectSchema = new mongoose.Schema(
+  {
+    title: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    description: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    fullDescription: {
+      type: String,
+      required: true,
+    },
+    image: {
+      type: String,
+      required: true,
+    },
+    category: {
+      type: String,
+      required: true,
+    },
+    technologies: {
+      type: [String],
+      default: [],
+    },
+    github: {
+      type: String,
+    },
+    demo: {
+      type: String,
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+const Project = mongoose.model("Project", projectSchema);
+
+// Get All Projects
+app.get("/api/projects", async (req, res) => {
+  try {
+    const { page = 1, limit = 10, category, search } = req.query;
+
+    // Build query
+    let query = {};
+
+    if (category) {
+      query.category = category;
+    }
+
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    // Pagination
+    const skip = (page - 1) * limit;
+
+    const projects = await Project.find(query)
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(skip);
+
+    const total = await Project.countDocuments(query);
+
+    res.status(200).json({
+      success: true,
+      count: projects.length,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / limit),
+      data: projects,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error fetching projects",
+      error: error.message,
+    });
+  }
+});
+
+// Get Single Project by ID
+app.get("/api/projects/:id", async (req, res) => {
+  try {
+    const project = await Project.findById(req.params.id);
+
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        message: "Project not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: project,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error fetching project",
+      error: error.message,
+    });
+  }
+});
 
 /* 
 -----------------------------------------------------------------------------------------
