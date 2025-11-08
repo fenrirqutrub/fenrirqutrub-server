@@ -62,13 +62,22 @@ const upload = multer({
 });
 
 // Middleware
-app.use(
-  cors({
-    origin: "https://fenrirqutrub-client.vercel.app" || "http://localhost:5173",
-    credentials: true,
-  })
-);
+const allowedOrigins = [
+  "https://fenrirqutrub-client.vercel.app",
+  "https://fenrirqutrub.vercel.app",
+];
 
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (allowedOrigins.indexOf(origin) !== -1 || !origin) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
