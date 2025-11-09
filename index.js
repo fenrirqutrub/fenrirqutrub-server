@@ -68,6 +68,7 @@ const allowedOrigins = [
   "http://localhost:5173",
 ];
 
+// Update the CORS configuration in your server.js
 const corsOptions = {
   origin: function (origin, callback) {
     if (allowedOrigins.indexOf(origin) !== -1 || !origin) {
@@ -76,9 +77,12 @@ const corsOptions = {
       callback(new Error("Not allowed by CORS"));
     }
   },
+  credentials: true, // ✅ Add this line
+  optionsSuccessStatus: 200,
 };
 
 app.use(cors(corsOptions));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
