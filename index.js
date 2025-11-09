@@ -65,6 +65,7 @@ const upload = multer({
 const allowedOrigins = [
   "https://fenrirqutrub-client.vercel.app",
   "https://fenrirqutrub.vercel.app",
+  "http://localhost:5173",
 ];
 
 const corsOptions = {
