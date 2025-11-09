@@ -10,6 +10,9 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 5000;
 
+// Trust proxy for Vercel/serverless environments
+app.set("trust proxy", 1);
+
 /* 
 =========================================================================================
                         CONFIGURATION & MIDDLEWARE
@@ -40,56 +43,115 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (like mobile apps, Postman, or server-to-server)
+      // Allow requests with no origin (mobile apps, Postman, server-to-server)
       if (!origin) {
         return callback(null, true);
       }
 
-      // Check if origin is in allowed list
+      // Check if origin is in whitelist
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
 
-      // Allow any vercel.app subdomain for development
+      // Allow any vercel.app subdomain
       if (origin.endsWith(".vercel.app")) {
         return callback(null, true);
       }
 
       // Reject other origins
+      console.warn(`🚫 CORS blocked origin: ${origin}`);
       callback(new Error(`Origin ${origin} not allowed by CORS`));
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    exposedHeaders: ["Content-Range", "X-Content-Range"],
+    maxAge: 600, // 10 minutes
     optionsSuccessStatus: 200,
   })
 );
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Body parsing middleware
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    console.log(`${req.method} ${req.path} ${res.statusCode} - ${duration}ms`);
+  });
+  next();
+});
 
 // Multer Configuration
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB
+    files: 5, // Maximum 5 files per request
+  },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith("image/")) {
+    const allowedMimes = [
+      "image/jpeg",
+      "image/jpg",
+      "image/png",
+      "image/gif",
+      "image/webp",
+    ];
+
+    if (allowedMimes.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error("Only image files are allowed!"));
+      cb(
+        new Error(
+          `Invalid file type: ${file.mimetype}. Only images are allowed.`
+        )
+      );
     }
   },
 });
 
-// MongoDB Connection
-const connectDB = async () => {
+// MongoDB Connection with retry logic
+const connectDB = async (retries = 5) => {
   try {
-    await mongoose.connect(process.env.MONGODB_URI);
+    const options = {
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    };
+
+    await mongoose.connect(process.env.MONGODB_URI, options);
     console.log("✅ Successfully connected to MongoDB!");
+
+    // MongoDB connection event listeners
+    mongoose.connection.on("error", (err) => {
+      console.error("❌ MongoDB connection error:", err);
+    });
+
+    mongoose.connection.on("disconnected", () => {
+      console.warn("⚠️  MongoDB disconnected. Attempting to reconnect...");
+    });
+
+    mongoose.connection.on("reconnected", () => {
+      console.log("✅ MongoDB reconnected!");
+    });
   } catch (error) {
-    console.error("❌ MongoDB connection error:", error);
-    process.exit(1);
+    console.error(
+      `❌ MongoDB connection error (${retries} retries left):`,
+      error.message
+    );
+
+    if (retries > 0) {
+      console.log(`Retrying in 5 seconds...`);
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      return connectDB(retries - 1);
+    } else {
+      console.error("❌ Failed to connect to MongoDB after multiple retries");
+      process.exit(1);
+    }
   }
 };
 
@@ -116,14 +178,23 @@ const categorySchema = new mongoose.Schema(
       type: String,
       unique: true,
       lowercase: true,
+      index: true,
     },
     articleCount: {
       type: Number,
       default: 0,
+      min: 0,
     },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
 );
+
+// Index for faster queries
+categorySchema.index({ categoryName: 1 });
 
 categorySchema.pre("save", function (next) {
   if (this.isModified("categoryName")) {
@@ -144,6 +215,7 @@ const articleSchema = new mongoose.Schema(
       type: String,
       required: [true, "Category is required"],
       trim: true,
+      index: true,
     },
     avatar: {
       type: String,
@@ -160,12 +232,14 @@ const articleSchema = new mongoose.Schema(
       required: [true, "Title is required"],
       trim: true,
       minlength: [5, "Title must be at least 5 characters"],
+      maxlength: [200, "Title must not exceed 200 characters"],
     },
     description: {
       type: String,
       required: [true, "Description is required"],
       trim: true,
       minlength: [20, "Description must be at least 20 characters"],
+      maxlength: [1000, "Description must not exceed 1000 characters"],
     },
     code: {
       type: String,
@@ -175,26 +249,44 @@ const articleSchema = new mongoose.Schema(
       type: String,
       unique: true,
       lowercase: true,
+      index: true,
     },
     views: {
       type: Number,
       default: 0,
+      min: 0,
     },
     likes: {
       type: Number,
       default: 0,
+      min: 0,
     },
-    likedBy: [String],
+    likedBy: {
+      type: [String],
+      default: [],
+    },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
 );
+
+// Indexes for better query performance
+articleSchema.index({ title: "text", description: "text" });
+articleSchema.index({ category: 1, createdAt: -1 });
+articleSchema.index({ views: -1 });
+articleSchema.index({ likes: -1 });
 
 articleSchema.pre("save", function (next) {
   if (this.isModified("title")) {
-    this.slug = this.title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)/g, "");
+    const timestamp = Date.now();
+    this.slug =
+      this.title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, "") + `-${timestamp}`;
   }
   next();
 });
@@ -208,11 +300,14 @@ const commentSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "Article",
       required: true,
+      index: true,
     },
     user: {
       type: String,
       required: [true, "User name is required"],
       trim: true,
+      minlength: [2, "User name must be at least 2 characters"],
+      maxlength: [50, "User name must not exceed 50 characters"],
     },
     text: {
       type: String,
@@ -224,10 +319,17 @@ const commentSchema = new mongoose.Schema(
     likes: {
       type: Number,
       default: 0,
+      min: 0,
     },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
 );
+
+commentSchema.index({ articleId: 1, createdAt: -1 });
 
 const Comment = mongoose.model("Comment", commentSchema);
 
@@ -236,32 +338,47 @@ const projectSchema = new mongoose.Schema(
   {
     title: {
       type: String,
-      required: true,
+      required: [true, "Title is required"],
       trim: true,
+      minlength: [3, "Title must be at least 3 characters"],
+      maxlength: [200, "Title must not exceed 200 characters"],
     },
     description: {
       type: String,
-      required: true,
+      required: [true, "Description is required"],
       trim: true,
+      minlength: [10, "Description must be at least 10 characters"],
+      maxlength: [500, "Description must not exceed 500 characters"],
     },
     fullDescription: {
       type: String,
-      required: true,
+      required: [true, "Full description is required"],
     },
     image: {
       type: String,
-      required: true,
+      required: [true, "Image is required"],
     },
     category: {
       type: String,
-      required: true,
+      required: [true, "Category is required"],
+      index: true,
     },
-    technologies: [String],
+    technologies: {
+      type: [String],
+      default: [],
+    },
     github: String,
     demo: String,
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
 );
+
+projectSchema.index({ title: "text", description: "text" });
+projectSchema.index({ category: 1, createdAt: -1 });
 
 const Project = mongoose.model("Project", projectSchema);
 
@@ -273,12 +390,20 @@ const Project = mongoose.model("Project", projectSchema);
 
 const uploadToCloudinary = (fileBuffer, folder = "articles") => {
   return new Promise((resolve, reject) => {
+    if (!fileBuffer) {
+      return reject(new Error("File buffer is required"));
+    }
+
     const uploadStream = cloudinary.uploader.upload_stream(
-      { folder, resource_type: "auto" },
+      {
+        folder,
+        resource_type: "auto",
+        transformation: [{ quality: "auto:good" }, { fetch_format: "auto" }],
+      },
       (error, result) => {
         if (error) {
           console.error("Cloudinary upload error:", error);
-          reject(error);
+          reject(new Error(`Cloudinary upload failed: ${error.message}`));
         } else {
           resolve(result);
         }
@@ -286,6 +411,17 @@ const uploadToCloudinary = (fileBuffer, folder = "articles") => {
     );
     uploadStream.end(fileBuffer);
   });
+};
+
+const deleteFromCloudinary = async (publicId) => {
+  if (!publicId) return;
+
+  try {
+    await cloudinary.uploader.destroy(publicId);
+    console.log(`✅ Deleted image: ${publicId}`);
+  } catch (error) {
+    console.error(`❌ Failed to delete image ${publicId}:`, error.message);
+  }
 };
 
 const formatTimeAgo = (date) => {
@@ -311,6 +447,17 @@ const asyncHandler = (fn) => (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch(next);
 };
 
+const validateObjectId = (id) => {
+  return mongoose.Types.ObjectId.isValid(id);
+};
+
+const sanitizeInput = (input) => {
+  if (typeof input === "string") {
+    return input.trim().replace(/[<>]/g, "");
+  }
+  return input;
+};
+
 /* 
 =========================================================================================
                         CATEGORY ROUTES
@@ -323,18 +470,27 @@ app.post(
   asyncHandler(async (req, res) => {
     const { categoryName } = req.body;
 
+    if (!categoryName || !categoryName.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Category name is required",
+      });
+    }
+
+    const sanitizedName = sanitizeInput(categoryName);
+
     const existingCategory = await Category.findOne({
-      categoryName: { $regex: new RegExp(`^${categoryName}$`, "i") },
+      categoryName: { $regex: new RegExp(`^${sanitizedName}$`, "i") },
     });
 
     if (existingCategory) {
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
         message: "Category already exists",
       });
     }
 
-    const category = await Category.create({ categoryName });
+    const category = await Category.create({ categoryName: sanitizedName });
 
     res.status(201).json({
       success: true,
@@ -348,7 +504,10 @@ app.post(
 app.get(
   "/api/categories",
   asyncHandler(async (req, res) => {
-    const categories = await Category.find().sort({ createdAt: -1 });
+    const categories = await Category.find()
+      .sort({ createdAt: -1 })
+      .lean()
+      .select("-__v");
 
     res.status(200).json({
       success: true,
@@ -362,7 +521,14 @@ app.get(
 app.get(
   "/api/categories/:id",
   asyncHandler(async (req, res) => {
-    const category = await Category.findById(req.params.id);
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid category ID format",
+      });
+    }
+
+    const category = await Category.findById(req.params.id).lean();
 
     if (!category) {
       return res.status(404).json({
@@ -382,15 +548,31 @@ app.get(
 app.put(
   "/api/categories/:id",
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid category ID format",
+      });
+    }
+
     const { categoryName } = req.body;
 
+    if (!categoryName || !categoryName.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Category name is required",
+      });
+    }
+
+    const sanitizedName = sanitizeInput(categoryName);
+
     const existingCategory = await Category.findOne({
-      categoryName: { $regex: new RegExp(`^${categoryName}$`, "i") },
+      categoryName: { $regex: new RegExp(`^${sanitizedName}$`, "i") },
       _id: { $ne: req.params.id },
     });
 
     if (existingCategory) {
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
         message: "Category name already exists",
       });
@@ -398,7 +580,7 @@ app.put(
 
     const category = await Category.findByIdAndUpdate(
       req.params.id,
-      { categoryName },
+      { categoryName: sanitizedName },
       { new: true, runValidators: true }
     );
 
@@ -421,6 +603,13 @@ app.put(
 app.delete(
   "/api/categories/:id",
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid category ID format",
+      });
+    }
+
     const category = await Category.findByIdAndDelete(req.params.id);
 
     if (!category) {
@@ -443,6 +632,128 @@ app.delete(
 =========================================================================================
 */
 
+// Get Most Viewed Articles (MUST come before /:id route)
+app.get(
+  "/api/articles/most-viewed",
+  asyncHandler(async (req, res) => {
+    const { limit = 10 } = req.query;
+
+    const articles = await Article.find()
+      .sort({ views: -1 })
+      .limit(Math.min(+limit, 50))
+      .select("title slug views category img createdAt likes")
+      .lean();
+
+    res.status(200).json({
+      success: true,
+      count: articles.length,
+      data: articles,
+    });
+  })
+);
+
+// Get Liked Articles (MUST come before /:id route)
+app.get(
+  "/api/articles/liked",
+  asyncHandler(async (req, res) => {
+    const { userId } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "User ID is required",
+      });
+    }
+
+    const userIdentifier = sanitizeInput(userId);
+
+    const likedArticles = await Article.find({
+      likedBy: userIdentifier,
+    })
+      .sort({ createdAt: -1 })
+      .lean()
+      .select("-__v");
+
+    res.status(200).json({
+      success: true,
+      count: likedArticles.length,
+      data: likedArticles,
+    });
+  })
+);
+
+// Get Article by Slug (MUST come before /:id route)
+app.get(
+  "/api/articles/slug/:slug",
+  asyncHandler(async (req, res) => {
+    const article = await Article.findOne({ slug: req.params.slug }).lean();
+
+    if (!article) {
+      return res.status(404).json({
+        success: false,
+        message: "Article not found",
+      });
+    }
+
+    // Increment view count asynchronously (fire and forget)
+    Article.findByIdAndUpdate(article._id, { $inc: { views: 1 } }).exec();
+
+    res.status(200).json({
+      success: true,
+      data: article,
+    });
+  })
+);
+
+// Get All Articles
+app.get(
+  "/api/articles",
+  asyncHandler(async (req, res) => {
+    const {
+      category,
+      page = 1,
+      limit = 10,
+      search,
+      sortBy = "createdAt",
+    } = req.query;
+
+    const query = {};
+    if (category) query.category = sanitizeInput(category);
+    if (search) {
+      const sanitizedSearch = sanitizeInput(search);
+      query.$or = [
+        { title: { $regex: sanitizedSearch, $options: "i" } },
+        { description: { $regex: sanitizedSearch, $options: "i" } },
+      ];
+    }
+
+    const validSortFields = ["createdAt", "views", "likes", "title"];
+    const sortField = validSortFields.includes(sortBy) ? sortBy : "createdAt";
+
+    const skip = (Math.max(1, +page) - 1) * Math.min(+limit, 50);
+    const limitValue = Math.min(+limit, 50);
+
+    const [articles, total] = await Promise.all([
+      Article.find(query)
+        .sort({ [sortField]: -1 })
+        .limit(limitValue)
+        .skip(skip)
+        .lean()
+        .select("-__v"),
+      Article.countDocuments(query),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      count: articles.length,
+      total,
+      page: +page,
+      totalPages: Math.ceil(total / limitValue),
+      data: articles,
+    });
+  })
+);
+
 // Create Article
 app.post(
   "/api/articles",
@@ -453,40 +764,50 @@ app.post(
   asyncHandler(async (req, res) => {
     const { category, title, description, code } = req.body;
 
+    // Validate required fields
     if (!category || !title || !description || !code) {
       return res.status(400).json({
         success: false,
-        message: "All fields are required",
+        message: "All fields (category, title, description, code) are required",
       });
     }
 
-    if (!req.files?.avatar || !req.files?.img) {
+    // Validate files
+    if (!req.files?.avatar?.[0] || !req.files?.img?.[0]) {
       return res.status(400).json({
         success: false,
-        message: "Avatar and image are required",
+        message: "Avatar and image files are required",
       });
     }
 
+    // Sanitize inputs
+    const sanitizedData = {
+      category: sanitizeInput(category),
+      title: sanitizeInput(title),
+      description: sanitizeInput(description),
+      code: code, // Code can contain special characters
+    };
+
+    // Upload images in parallel
     const [avatarResult, imgResult] = await Promise.all([
       uploadToCloudinary(req.files.avatar[0].buffer, "articles/avatars"),
       uploadToCloudinary(req.files.img[0].buffer, "articles/images"),
     ]);
 
+    // Create article
     const article = await Article.create({
-      category,
+      ...sanitizedData,
       avatar: avatarResult.secure_url,
       avatarPublicId: avatarResult.public_id,
       img: imgResult.secure_url,
       imgPublicId: imgResult.public_id,
-      title,
-      description,
-      code,
     });
 
-    await Category.findOneAndUpdate(
-      { categoryName: category },
+    // Update category count asynchronously
+    Category.findOneAndUpdate(
+      { categoryName: sanitizedData.category },
       { $inc: { articleCount: 1 } }
-    );
+    ).exec();
 
     res.status(201).json({
       success: true,
@@ -496,43 +817,18 @@ app.post(
   })
 );
 
-// Get All Articles
-app.get(
-  "/api/articles",
-  asyncHandler(async (req, res) => {
-    const { category, page = 1, limit = 10, search } = req.query;
-
-    const query = {};
-    if (category) query.category = category;
-    if (search) {
-      query.$or = [
-        { title: { $regex: search, $options: "i" } },
-        { description: { $regex: search, $options: "i" } },
-      ];
-    }
-
-    const skip = (page - 1) * limit;
-    const [articles, total] = await Promise.all([
-      Article.find(query).sort({ createdAt: -1 }).limit(+limit).skip(skip),
-      Article.countDocuments(query),
-    ]);
-
-    res.status(200).json({
-      success: true,
-      count: articles.length,
-      total,
-      page: +page,
-      totalPages: Math.ceil(total / limit),
-      data: articles,
-    });
-  })
-);
-
 // Get Single Article by ID
 app.get(
   "/api/articles/:id",
   asyncHandler(async (req, res) => {
-    const article = await Article.findById(req.params.id);
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
+    const article = await Article.findById(req.params.id).lean();
 
     if (!article) {
       return res.status(404).json({
@@ -541,31 +837,8 @@ app.get(
       });
     }
 
-    article.views += 1;
-    await article.save();
-
-    res.status(200).json({
-      success: true,
-      data: article,
-    });
-  })
-);
-
-// Get Article by Slug
-app.get(
-  "/api/articles/slug/:slug",
-  asyncHandler(async (req, res) => {
-    const article = await Article.findOne({ slug: req.params.slug });
-
-    if (!article) {
-      return res.status(404).json({
-        success: false,
-        message: "Article not found",
-      });
-    }
-
-    article.views += 1;
-    await article.save();
+    // Increment view count asynchronously
+    Article.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } }).exec();
 
     res.status(200).json({
       success: true,
@@ -582,6 +855,13 @@ app.put(
     { name: "img", maxCount: 1 },
   ]),
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
     const article = await Article.findById(req.params.id);
 
     if (!article) {
@@ -591,30 +871,40 @@ app.put(
       });
     }
 
-    const updateData = { ...req.body };
+    const updateData = {};
 
-    if (req.files?.avatar) {
-      if (article.avatarPublicId) {
-        await cloudinary.uploader.destroy(article.avatarPublicId);
-      }
+    // Sanitize text fields
+    if (req.body.title) updateData.title = sanitizeInput(req.body.title);
+    if (req.body.description)
+      updateData.description = sanitizeInput(req.body.description);
+    if (req.body.category)
+      updateData.category = sanitizeInput(req.body.category);
+    if (req.body.code) updateData.code = req.body.code;
+
+    // Handle avatar update
+    if (req.files?.avatar?.[0]) {
       const avatarResult = await uploadToCloudinary(
         req.files.avatar[0].buffer,
         "articles/avatars"
       );
       updateData.avatar = avatarResult.secure_url;
       updateData.avatarPublicId = avatarResult.public_id;
+
+      // Delete old avatar
+      deleteFromCloudinary(article.avatarPublicId);
     }
 
-    if (req.files?.img) {
-      if (article.imgPublicId) {
-        await cloudinary.uploader.destroy(article.imgPublicId);
-      }
+    // Handle image update
+    if (req.files?.img?.[0]) {
       const imgResult = await uploadToCloudinary(
         req.files.img[0].buffer,
         "articles/images"
       );
       updateData.img = imgResult.secure_url;
       updateData.imgPublicId = imgResult.public_id;
+
+      // Delete old image
+      deleteFromCloudinary(article.imgPublicId);
     }
 
     const updatedArticle = await Article.findByIdAndUpdate(
@@ -635,6 +925,13 @@ app.put(
 app.delete(
   "/api/articles/:id",
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
     const article = await Article.findById(req.params.id);
 
     if (!article) {
@@ -644,10 +941,10 @@ app.delete(
       });
     }
 
+    // Delete images and article in parallel
     await Promise.all([
-      article.avatarPublicId &&
-        cloudinary.uploader.destroy(article.avatarPublicId),
-      article.imgPublicId && cloudinary.uploader.destroy(article.imgPublicId),
+      deleteFromCloudinary(article.avatarPublicId),
+      deleteFromCloudinary(article.imgPublicId),
       Article.findByIdAndDelete(req.params.id),
       Category.findOneAndUpdate(
         { categoryName: article.category },
@@ -672,8 +969,17 @@ app.delete(
 app.post(
   "/api/articles/:id/like",
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
     const { userId } = req.body;
-    const userIdentifier = userId || `guest_${req.ip}_${Date.now()}`;
+    const userIdentifier = userId
+      ? sanitizeInput(userId)
+      : `guest_${req.ip}_${Date.now()}`;
 
     const article = await Article.findById(req.params.id);
 
@@ -698,7 +1004,10 @@ app.post(
     res.status(200).json({
       success: true,
       message: "Article liked successfully",
-      data: article,
+      data: {
+        likes: article.likes,
+        articleId: article._id,
+      },
     });
   })
 );
@@ -707,8 +1016,15 @@ app.post(
 app.post(
   "/api/articles/:id/unlike",
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
     const { userId } = req.body;
-    const userIdentifier = userId || `guest_${req.ip}_${Date.now()}`;
+    const userIdentifier = userId ? sanitizeInput(userId) : `guest_${req.ip}`;
 
     const article = await Article.findById(req.params.id);
 
@@ -733,7 +1049,10 @@ app.post(
     res.status(200).json({
       success: true,
       message: "Article unliked successfully",
-      data: article,
+      data: {
+        likes: article.likes,
+        articleId: article._id,
+      },
     });
   })
 );
@@ -742,10 +1061,17 @@ app.post(
 app.get(
   "/api/articles/:id/like-status",
   asyncHandler(async (req, res) => {
-    const { userId } = req.query;
-    const userIdentifier = userId || `guest_${req.ip}`;
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
 
-    const article = await Article.findById(req.params.id);
+    const { userId } = req.query;
+    const userIdentifier = userId ? sanitizeInput(userId) : `guest_${req.ip}`;
+
+    const article = await Article.findById(req.params.id).lean();
 
     if (!article) {
       return res.status(404).json({
@@ -765,30 +1091,20 @@ app.get(
   })
 );
 
-// Get Liked Articles
-app.get(
-  "/api/articles/liked",
-  asyncHandler(async (req, res) => {
-    const { userId } = req.query;
-    const userIdentifier = userId || `guest_${req.ip}`;
-
-    const likedArticles = await Article.find({
-      likedBy: userIdentifier,
-    }).sort({ createdAt: -1 });
-
-    res.status(200).json({
-      success: true,
-      count: likedArticles.length,
-      data: likedArticles,
-    });
-  })
-);
-
 // Get Like Statistics
 app.get(
   "/api/articles/:id/like-stats",
   asyncHandler(async (req, res) => {
-    const article = await Article.findById(req.params.id);
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
+    const article = await Article.findById(req.params.id)
+      .lean()
+      .select("likes likedBy _id");
 
     if (!article) {
       return res.status(404).json({
@@ -817,10 +1133,17 @@ app.get(
 app.post(
   "/api/articles/:id/view",
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
     const article = await Article.findByIdAndUpdate(
       req.params.id,
       { $inc: { views: 1 } },
-      { new: true }
+      { new: true, select: "views _id" }
     );
 
     if (!article) {
@@ -845,7 +1168,16 @@ app.post(
 app.get(
   "/api/articles/:id/view-stats",
   asyncHandler(async (req, res) => {
-    const article = await Article.findById(req.params.id);
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
+    const article = await Article.findById(req.params.id)
+      .lean()
+      .select("views title _id");
 
     if (!article) {
       return res.status(404).json({
@@ -865,25 +1197,6 @@ app.get(
   })
 );
 
-// Get Most Viewed Articles
-app.get(
-  "/api/articles/most-viewed",
-  asyncHandler(async (req, res) => {
-    const { limit = 10 } = req.query;
-
-    const articles = await Article.find()
-      .sort({ views: -1 })
-      .limit(+limit)
-      .select("title slug views category img createdAt");
-
-    res.status(200).json({
-      success: true,
-      count: articles.length,
-      data: articles,
-    });
-  })
-);
-
 /* 
 =========================================================================================
                         COMMENT ROUTES
@@ -894,9 +1207,26 @@ app.get(
 app.get(
   "/api/articles/:id/comments",
   asyncHandler(async (req, res) => {
-    const comments = await Comment.find({ articleId: req.params.id })
-      .sort({ createdAt: -1 })
-      .lean();
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
+    const { page = 1, limit = 20 } = req.query;
+    const skip = (Math.max(1, +page) - 1) * Math.min(+limit, 50);
+    const limitValue = Math.min(+limit, 50);
+
+    const [comments, total] = await Promise.all([
+      Comment.find({ articleId: req.params.id })
+        .sort({ createdAt: -1 })
+        .limit(limitValue)
+        .skip(skip)
+        .lean()
+        .select("-__v"),
+      Comment.countDocuments({ articleId: req.params.id }),
+    ]);
 
     const formattedComments = comments.map((comment) => ({
       _id: comment._id,
@@ -910,6 +1240,9 @@ app.get(
     res.status(200).json({
       success: true,
       count: formattedComments.length,
+      total,
+      page: +page,
+      totalPages: Math.ceil(total / limitValue),
       data: formattedComments,
     });
   })
@@ -919,17 +1252,25 @@ app.get(
 app.post(
   "/api/articles/:id/comments",
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
+
     const { user, text } = req.body;
 
-    if (!user || !text) {
+    if (!user || !text || !user.trim() || !text.trim()) {
       return res.status(400).json({
         success: false,
         message: "User name and comment text are required",
       });
     }
 
-    const article = await Article.findById(req.params.id);
-    if (!article) {
+    // Check if article exists
+    const articleExists = await Article.exists({ _id: req.params.id });
+    if (!articleExists) {
       return res.status(404).json({
         success: false,
         message: "Article not found",
@@ -938,8 +1279,8 @@ app.post(
 
     const comment = await Comment.create({
       articleId: req.params.id,
-      user,
-      text,
+      user: sanitizeInput(user),
+      text: sanitizeInput(text),
     });
 
     res.status(201).json({
@@ -961,10 +1302,17 @@ app.post(
 app.post(
   "/api/comments/:id/like",
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid comment ID format",
+      });
+    }
+
     const comment = await Comment.findByIdAndUpdate(
       req.params.id,
       { $inc: { likes: 1 } },
-      { new: true }
+      { new: true, select: "likes _id" }
     );
 
     if (!comment) {
@@ -977,7 +1325,10 @@ app.post(
     res.status(200).json({
       success: true,
       message: "Comment liked successfully",
-      data: comment,
+      data: {
+        likes: comment.likes,
+        commentId: comment._id,
+      },
     });
   })
 );
@@ -986,6 +1337,13 @@ app.post(
 app.delete(
   "/api/comments/:id",
   asyncHandler(async (req, res) => {
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid comment ID format",
+      });
+    }
+
     const comment = await Comment.findByIdAndDelete(req.params.id);
 
     if (!comment) {
@@ -1015,17 +1373,25 @@ app.get(
     const { page = 1, limit = 10, category, search } = req.query;
 
     const query = {};
-    if (category) query.category = category;
+    if (category) query.category = sanitizeInput(category);
     if (search) {
+      const sanitizedSearch = sanitizeInput(search);
       query.$or = [
-        { title: { $regex: search, $options: "i" } },
-        { description: { $regex: search, $options: "i" } },
+        { title: { $regex: sanitizedSearch, $options: "i" } },
+        { description: { $regex: sanitizedSearch, $options: "i" } },
       ];
     }
 
-    const skip = (page - 1) * limit;
+    const skip = (Math.max(1, +page) - 1) * Math.min(+limit, 50);
+    const limitValue = Math.min(+limit, 50);
+
     const [projects, total] = await Promise.all([
-      Project.find(query).sort({ createdAt: -1 }).limit(+limit).skip(skip),
+      Project.find(query)
+        .sort({ createdAt: -1 })
+        .limit(limitValue)
+        .skip(skip)
+        .lean()
+        .select("-__v"),
       Project.countDocuments(query),
     ]);
 
@@ -1034,7 +1400,7 @@ app.get(
       count: projects.length,
       total,
       page: +page,
-      totalPages: Math.ceil(total / limit),
+      totalPages: Math.ceil(total / limitValue),
       data: projects,
     });
   })
@@ -1044,7 +1410,14 @@ app.get(
 app.get(
   "/api/projects/:id",
   asyncHandler(async (req, res) => {
-    const project = await Project.findById(req.params.id);
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid project ID format",
+      });
+    }
+
+    const project = await Project.findById(req.params.id).lean();
 
     if (!project) {
       return res.status(404).json({
@@ -1070,9 +1443,16 @@ app.get(
 app.post(
   "/api/articles/:id/share",
   asyncHandler(async (req, res) => {
-    const article = await Article.findById(req.params.id);
+    if (!validateObjectId(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid article ID format",
+      });
+    }
 
-    if (!article) {
+    const articleExists = await Article.exists({ _id: req.params.id });
+
+    if (!articleExists) {
       return res.status(404).json({
         success: false,
         message: "Article not found",
@@ -1098,23 +1478,31 @@ app.get("/", (req, res) => {
     name: "Fenrir Qutrub Server 🚀",
     version: "2.0.0",
     status: "running",
+    timestamp: new Date().toISOString(),
     endpoints: {
       categories: "/api/categories",
       articles: "/api/articles",
       projects: "/api/projects",
       comments: "/api/articles/:id/comments",
+      health: "/health",
     },
   });
 });
 
 // Health Check
 app.get("/health", (req, res) => {
-  res.status(200).json({
+  const health = {
     success: true,
     message: "Server is healthy",
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-  });
+    environment: process.env.NODE_ENV || "development",
+    database:
+      mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+  };
+
+  const statusCode = mongoose.connection.readyState === 1 ? 200 : 503;
+  res.status(statusCode).json(health);
 });
 
 // 404 Handler
@@ -1123,13 +1511,15 @@ app.use((req, res) => {
     success: false,
     message: "Route not found",
     path: req.originalUrl,
+    method: req.method,
   });
 });
 
 // Global Error Handler
 app.use((err, req, res, next) => {
-  console.error("❌ Error:", err.stack);
+  console.error("❌ Error:", err);
 
+  // Mongoose validation error
   if (err.name === "ValidationError") {
     return res.status(400).json({
       success: false,
@@ -1138,17 +1528,69 @@ app.use((err, req, res, next) => {
     });
   }
 
+  // Mongoose cast error (invalid ObjectId)
   if (err.name === "CastError") {
     return res.status(400).json({
       success: false,
-      message: "Invalid ID format",
+      message: `Invalid ${err.path}: ${err.value}`,
     });
   }
 
-  res.status(err.status || 500).json({
+  // Mongoose duplicate key error
+  if (err.code === 11000) {
+    const field = Object.keys(err.keyPattern)[0];
+    return res.status(409).json({
+      success: false,
+      message: `${field} already exists`,
+    });
+  }
+
+  // Multer file upload error
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({
+        success: false,
+        message: "File size too large. Maximum size is 5MB",
+      });
+    }
+    return res.status(400).json({
+      success: false,
+      message: `File upload error: ${err.message}`,
+    });
+  }
+
+  // CORS error
+  if (err.message.includes("CORS")) {
+    return res.status(403).json({
+      success: false,
+      message: "CORS: Origin not allowed",
+    });
+  }
+
+  // JWT errors (if you add authentication later)
+  if (err.name === "JsonWebTokenError") {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid token",
+    });
+  }
+
+  if (err.name === "TokenExpiredError") {
+    return res.status(401).json({
+      success: false,
+      message: "Token expired",
+    });
+  }
+
+  // Default error
+  const statusCode = err.statusCode || err.status || 500;
+  res.status(statusCode).json({
     success: false,
-    message: err.message || "Something went wrong!",
-    ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
+    message: err.message || "Internal server error",
+    ...(process.env.NODE_ENV === "development" && {
+      stack: err.stack,
+      error: err,
+    }),
   });
 });
 
@@ -1158,26 +1600,42 @@ app.use((err, req, res, next) => {
 =========================================================================================
 */
 
-// Start Server
-app.listen(port, () => {
-  console.log(`🚀 Fenrir Qutrub Server running on port ${port}`);
-  console.log(`📍 Environment: ${process.env.NODE_ENV || "development"}`);
-});
+// For local development
+if (process.env.NODE_ENV !== "production") {
+  app.listen(port, () => {
+    console.log(`🚀 Fenrir Qutrub Server running on port ${port}`);
+    console.log(`📍 Environment: ${process.env.NODE_ENV || "development"}`);
+    console.log(`🌐 Local: http://localhost:${port}`);
+  });
+}
 
 // Graceful Shutdown
-process.on("SIGINT", async () => {
-  console.log("\n🛑 Shutting down gracefully...");
-  await mongoose.connection.close();
-  console.log("✅ MongoDB connection closed");
-  process.exit(0);
+const gracefulShutdown = async (signal) => {
+  console.log(`\n🛑 ${signal} received, shutting down gracefully...`);
+
+  try {
+    await mongoose.connection.close();
+    console.log("✅ MongoDB connection closed");
+    process.exit(0);
+  } catch (error) {
+    console.error("❌ Error during shutdown:", error);
+    process.exit(1);
+  }
+};
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
+// Handle unhandled promise rejections
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("❌ Unhandled Rejection at:", promise, "reason:", reason);
 });
 
-process.on("SIGTERM", async () => {
-  console.log("\n🛑 SIGTERM received, shutting down...");
-  await mongoose.connection.close();
-  console.log("✅ MongoDB connection closed");
-  process.exit(0);
+// Handle uncaught exceptions
+process.on("uncaughtException", (error) => {
+  console.error("❌ Uncaught Exception:", error);
+  process.exit(1);
 });
 
-// Export for Vercel
+// Export for Vercel serverless
 export default app;
