@@ -32,42 +32,15 @@ console.log("☁️  Cloudinary Config:", {
   api_secret: process.env.CLOUDINARY_API_SECRET ? "✓ Set" : "✗ Missing",
 });
 
-// CORS Configuration
-const allowedOrigins = [
-  "https://fenrirqutrub-client.vercel.app",
-  "https://fenrirqutrub.vercel.app",
-  "http://localhost:5173",
-  "http://localhost:3000",
-];
-
+// CORS Configuration - Simplified for Vercel
+// This allows all origins to prevent deployment issues
 app.use(
   cors({
-    origin: (origin, callback) => {
-      // Allow requests with no origin (mobile apps, Postman, server-to-server)
-      if (!origin) {
-        return callback(null, true);
-      }
-
-      // Check if origin is in whitelist
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
-      // Allow any vercel.app subdomain
-      if (origin.endsWith(".vercel.app")) {
-        return callback(null, true);
-      }
-
-      // Reject other origins
-      console.warn(`🚫 CORS blocked origin: ${origin}`);
-      callback(new Error(`Origin ${origin} not allowed by CORS`));
-    },
+    origin: true, // Reflects the request origin, allowing all
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
-    exposedHeaders: ["Content-Range", "X-Content-Range"],
-    maxAge: 600, // 10 minutes
-    optionsSuccessStatus: 200,
+    optionsSuccessStatus: 204,
   })
 );
 
